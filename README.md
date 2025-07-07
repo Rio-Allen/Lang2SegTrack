@@ -102,7 +102,7 @@ Place them into `sam2/checkpoints/`:
   ```bash
   python scripts/lang2segtrack.py
   ```
-- **`track`**: Track objects in video files or real-time video streams by using first-frame prompts, text-prompts, mouse click(Ctrl + left) or manual boxes drawing. If you need a higher frame rate and don't need the text prompt feature, set it`gdino_16=True`
+- **`track`**: Track objects in video files or real-time video streams by using first-frame prompts, text-prompts, mouse click(Ctrl + left) or manual boxes drawing. If you need a higher frame rate and don't need the text prompt feature, set it`gdino_16=True`. You can also increase the tracking frame rate by setting the `image_size` parameter in the config file(`sam2/configs/samurai/`) to which the model belongs, for example, to 512.
 
 
 - **`predict_img`**: Predict objects in images by using text-prompts.

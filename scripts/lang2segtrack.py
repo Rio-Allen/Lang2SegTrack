@@ -24,7 +24,7 @@ from utils.utils import prepare_frames_or_path, bbox_process
 class Lang2SegTrack:
     def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
                  video_path:str="", output_path:str="", max_frames:int=20,
-                 first_prompts: list[list] | None = None, save_video=True,
+                 first_prompts: list | None = None, save_video=True,
                  gdino_16=False, device="cuda:0", mode="realtime"):
         self.sam_type = sam_type # the type of SAM model to use
         self.model_path = model_path # the path to the SAM model checkpoint
@@ -47,7 +47,8 @@ class Lang2SegTrack:
             self.gdino.build_model(device=device)
 
         self.input_queue = queue.Queue()
-        self.first_prompts = first_prompts # the initial bounding boxes or points to track. If not None, the tracker will use the first frame to detect objects.
+        self.first_prompts = first_prompts # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
+        #[mask, point, bbox], mask: np.ndarray[H, W], point: list[int], bbox: list[int]
         self.drawing = False
         self.add_new = False
         self.ix, self.iy = -1, -1
@@ -92,15 +93,18 @@ class Lang2SegTrack:
                 x1, y1, x2, y2 = item
                 cv2.rectangle(self.frame_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 predictor.add_new_points_or_box(state, box=item, frame_idx=state["num_frames"] - 1, obj_id=id)
-            else:
+            elif len(item) == 2:
                 x, y = item
                 cv2.circle(self.frame_display, (x, y), 5, (0, 255, 0), -1)
                 pt = torch.tensor([[x, y]], dtype=torch.float32)
                 lbl = torch.tensor([1], dtype=torch.int32)
                 predictor.add_new_points_or_box(state, points=pt, labels=lbl, frame_idx=state["num_frames"] - 1, obj_id=id)
+            else:
+                predictor.add_new_mask(state, mask=item, frame_idx=state["num_frames"] - 1, obj_id=id)
 
     def track_and_visualize(self, predictor, state, frame, writer):
-        if any(len(state["point_inputs_per_obj"][i]) > 0 for i in range(len(state["point_inputs_per_obj"]))):
+        if (any(len(state["point_inputs_per_obj"][i]) > 0 for i in range(len(state["point_inputs_per_obj"]))) or
+            any(len(state["mask_inputs_per_obj"][i]) > 0 for i in range(len(state["mask_inputs_per_obj"])))):
             for frame_idx, obj_ids, masks in predictor.propagate_in_frame(state, state["num_frames"] - 1):
                 self.prompts_list=[]
                 for obj_id, mask in zip(obj_ids, masks):
@@ -249,7 +253,7 @@ class Lang2SegTrack:
                 else:
                     ret, frame = get_frame()
                     if not ret:
-                        continue
+                        break
                 self.frame_display = frame.copy()
                 cv2.setMouseCallback("Video Tracking", self.draw_bbox, param=self.frame_display)
 
@@ -288,12 +292,14 @@ class Lang2SegTrack:
 
 
 if __name__ == "__main__":
-
+    mask = Image.open("mask_images/mask_0.png")
+    mask = np.array(mask)
     tracker = Lang2SegTrack(sam_type="sam2.1_hiera_tiny",
                             model_path="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
                             video_path="assets/05_default_juggle.mp4",
                             output_path="processed_video.mp4",
                             mode="video",
+                            first_prompts=[mask],
                             save_video=True,
                             gdino_16=True)
     tracker.track()
