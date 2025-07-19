@@ -6,6 +6,7 @@ Language-driven visual segmentation and object tracking system based on [Groundi
 ---
 ### 🔥 News
 
+- **`2025/07/19`**: Supports backward tracking of each object.
 - **`2025/05/08`**: Optimize memory usage and code logic.
 - **`2025/04/29`**: Initial version submission.
 
@@ -106,7 +107,11 @@ Place them into `sam2/checkpoints/`:
 
 
 - **`predict_img`**: Predict objects in images by using text-prompts.
-
+---
+  ```bash
+  python scripts/lang2segtrack_with_backward.py
+  ```
+- **`track`**: Supports backward tracking of the video frame before tracking after the forward tracking is completed, and finally returns the tracking data 'mask' of each tracked object in the entire video stream.
 ---
 
 ## 🙏 Acknowledgments

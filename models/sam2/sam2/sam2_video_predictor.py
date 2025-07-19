@@ -904,7 +904,6 @@ class SAM2VideoPredictor(SAM2Base):
             start_frame_idx=None,
             reverse=False,
     ):
-        """Propagate the input points across frames to track in the entire video."""
         self.propagate_in_video_preflight(inference_state)
 
         output_dict = inference_state["output_dict"]

@@ -17,7 +17,7 @@ from models.sam2.sam import SAM
 from utils.color import COLOR
 import pyrealsense2 as rs
 
-from utils.utils import prepare_frames_or_path, bbox_process
+from utils.utils import prepare_frames_or_path, bbox_process, save_frames_to_temp_dir
 
 
 class Lang2SegTrack:
@@ -35,7 +35,7 @@ class Lang2SegTrack:
         # and if the number of tracked objects is large and likely to be occluded, set it to a larger value(such as 60) to enhance tracking
         self.save_video = save_video # whether to save the output video
         self.device = device
-        self.mode = mode # the mode to run the tracker. "img", "video" or "realtime"
+        self.mode = mode # the mode to run the tracker. "video" or "realtime"
 
         self.sam = SAM()
         self.sam.build_model(self.sam_type, self.model_path, predictor_type=mode, device=device)
@@ -44,6 +44,11 @@ class Lang2SegTrack:
         if not gdino_16:
             print("Building GroundingDINO model...")
             self.gdino.build_model(device=device)
+
+        self.history_frames = []
+        self.object_start_frame_idx = {}
+        self.object_start_promts = {}
+        self.all_forward_masks = {}
 
         self.input_queue = queue.Queue()
         self.first_prompts = first_prompts # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
@@ -55,10 +60,14 @@ class Lang2SegTrack:
         self.height, self.width = None, None
         if self.first_prompts is not None:
             self.prompts_list = self.first_prompts
+            for obj_id, prompt in enumerate(self.prompts_list):
+                self.object_start_frame_idx[obj_id] = 0
+                self.object_start_promts.setdefault(obj_id, []).append(prompt)
             self.add_new = True
         else:
             self.prompts_list = []
         self.prev_time = 0
+
 
     def input_thread(self):
         while True:
@@ -86,20 +95,21 @@ class Lang2SegTrack:
                 cv2.rectangle(param, (self.ix, self.iy), (x, y), (0, 255, 0), 2)
             self.drawing = False
 
-    def add_to_state(self, predictor, state, list):
+    def add_to_state(self, predictor, state, list, start_with_0=False):
+        frame_idx = 0 if start_with_0 else state["num_frames"]-1
         for id, item in enumerate(list):
             if len(item) == 4:
                 x1, y1, x2, y2 = item
                 cv2.rectangle(self.frame_display, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                predictor.add_new_points_or_box(state, box=item, frame_idx=state["num_frames"] - 1, obj_id=id)
+                predictor.add_new_points_or_box(state, box=item, frame_idx=frame_idx, obj_id=id)
             elif len(item) == 2:
                 x, y = item
                 cv2.circle(self.frame_display, (x, y), 5, (0, 255, 0), -1)
                 pt = torch.tensor([[x, y]], dtype=torch.float32)
                 lbl = torch.tensor([1], dtype=torch.int32)
-                predictor.add_new_points_or_box(state, points=pt, labels=lbl, frame_idx=state["num_frames"] - 1, obj_id=id)
+                predictor.add_new_points_or_box(state, points=pt, labels=lbl, frame_idx=frame_idx, obj_id=id)
             else:
-                predictor.add_new_mask(state, mask=item, frame_idx=state["num_frames"] - 1, obj_id=id)
+                predictor.add_new_mask(state, mask=item, frame_idx=frame_idx, obj_id=id)
 
     def track_and_visualize(self, predictor, state, frame, writer):
         if (any(len(state["point_inputs_per_obj"][i]) > 0 for i in range(len(state["point_inputs_per_obj"]))) or
@@ -108,6 +118,7 @@ class Lang2SegTrack:
                 self.prompts_list=[]
                 for obj_id, mask in zip(obj_ids, masks):
                     mask = mask[0].cpu().numpy() > 0.0
+                    self.all_forward_masks.setdefault(obj_id, []).append(mask)
                     nonzero = np.argwhere(mask)
                     if nonzero.size == 0:
                         bbox = [0, 0, 0, 0]
@@ -142,74 +153,82 @@ class Lang2SegTrack:
         cv2.putText(frame, fps_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
 
-    def predict_img(
-        self,
-        images_pil: list[Image.Image],
-        texts_prompt: list[str],
-        box_threshold: float = 0.3,
-        text_threshold: float = 0.25,
-    ):
-        """Predicts masks for given images and text prompts using GDINO and SAM models.
+    def visualize_final_masks(self, output_path="final_tracked_output.mp4", fps=25):
+        if not hasattr(self, "all_final_masks") or not self.all_final_masks:
+            print("No final masks found. Please run `track()` and `track_backward()` first.")
+            return
 
-        Parameters:
-            images_pil (list[Image.Image]): List of input images.
-            texts_prompt (list[str]): List of text prompts corresponding to the images.
-            box_threshold (float): Threshold for box predictions.
-            text_threshold (float): Threshold for text predictions.
+        print("Visualizing final tracking results...")
+        num_frames = len(self.all_final_masks[0])
+        assert len(self.history_frames)== num_frames
+        writer = imageio.get_writer(output_path, fps=fps)
 
-        Returns:
-            list[dict]: List of results containing masks and other outputs for each image.
-            Output format:
-            [{
-                "boxes": np.ndarray,
-                "scores": np.ndarray,
-                "masks": np.ndarray,
-                "mask_scores": np.ndarray,
-            }, ...]
-        """
-        if self.mode != "img":
-            raise ValueError("This method only support use 'img' mode")
-        if self.gdino_16:
-            if len(images_pil) > 1:
-                raise ValueError("GroundingDINO_16 only support single image")
-            byte_io = BytesIO()
-            images_pil[0].save(byte_io, format='PNG')
-            image_bytes = byte_io.getvalue()
-            base64_encoded = base64.b64encode(image_bytes).decode('utf-8')
-            texts_prompt = texts_prompt[0]
-            gdino_results = self.gdino.predict_dino_1_6_pro(base64_encoded, texts_prompt, box_threshold, text_threshold)
-        else:
-            gdino_results = self.gdino.predict(images_pil, texts_prompt, box_threshold, text_threshold)
-        all_results = []
-        sam_images = []
-        sam_boxes = []
-        sam_indices = []
-        for idx, result in enumerate(gdino_results):
-            result = {k: (v.cpu().numpy() if hasattr(v, "numpy") else v) for k, v in result.items()}
-            processed_result = {
-                **result,
-                "masks": [],
-                "mask_scores": [],
-            }
+        for frame_idx in range(num_frames):
+            base_frame = self.history_frames[frame_idx].copy()
+            for obj_id, mask_list in self.all_final_masks.items():
+                mask = mask_list[frame_idx]
+                nonzero = np.argwhere(mask)
+                if nonzero.size == 0:
+                    bbox = [0, 0, 0, 0]
+                else:
+                    y_min, x_min = nonzero.min(axis=0)
+                    y_max, x_max = nonzero.max(axis=0)
+                    bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
+                self.draw_mask_and_bbox(base_frame, mask, bbox, obj_id)
 
-            if result["labels"]:
-                sam_images.append(np.asarray(images_pil[idx]))
-                sam_boxes.append(processed_result["boxes"])
-                sam_indices.append(idx)
+            writer.append_data(cv2.cvtColor(base_frame, cv2.COLOR_BGR2RGB))
+            cv2.imshow("Final Tracking Visualization", base_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-            all_results.append(processed_result)
-        if sam_images:
-            # print(f"Predicting {len(sam_boxes)} masks")
-            masks, mask_scores, _ = self.sam.predict_batch(sam_images, xyxy=sam_boxes)
-            for idx, mask, score in zip(sam_indices, masks, mask_scores):
-                all_results[idx].update(
-                    {
-                        "masks": mask,
-                        "mask_scores": score,
-                    }
-                )
-            # print(f"Predicted {len(all_results)} masks")
-        return all_results
+        writer.close()
+        print(f"Final visualization saved to {output_path}")
+        cv2.destroyAllWindows()
+
+    def track_backward(self):
+        predictor = self.sam.video_predictor
+
+        print("Starting backward tracking for each object...")
+        all_final_masks = {}
+        # print(len(self.all_forward_masks[0]))
+        # print(len(self.all_forward_masks[1]))
+        # print(len(self.all_forward_masks[2]))
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+            for obj_id in range(max(self.object_start_frame_idx)+1):
+
+                start_idx = self.object_start_frame_idx[obj_id]
+                if start_idx == 0:
+                    full_masks = self.all_forward_masks[obj_id]
+                else:
+                    print('\n')
+                    print(f"\033[92mINFO: Object_{obj_id} is being tracked backward in time......\033[0m")
+                    history_frames = self.history_frames[:start_idx]
+                    history_frames = history_frames[::-1]
+                    frames = save_frames_to_temp_dir(history_frames)
+                    prompt = self.object_start_promts[obj_id]
+                    reverse_state = predictor.init_state(
+                        frames, offload_state_to_cpu=False, offload_video_to_cpu=False
+                    )
+                    self.add_to_state(predictor, reverse_state, [prompt], start_with_0=True)
+                    backward_masks = []
+                    for frame_idx, obj_ids, masks in predictor.propagate_in_video(reverse_state):
+                        for mid, mask in zip(obj_ids, masks):
+                            mask_np = mask[0].cpu().numpy() > 0.0
+                            backward_masks.append(mask_np)
+
+                    backward_masks = backward_masks[::-1]
+                    forward_masks = self.all_forward_masks.get(obj_id, [])
+                    full_masks = backward_masks + forward_masks[1:] if len(forward_masks) > 1 else backward_masks
+                    #predictor.reset_state(reverse_state)
+                all_final_masks[obj_id] = full_masks
+
+
+        print("Backward tracking completed. Merged object trajectories are ready.")
+        self.all_final_masks = all_final_masks
+        # print(len(self.all_final_masks[0]))
+        # print(len(self.all_final_masks[1]))
+        # print(len(self.all_final_masks[2]))
+
 
     def track(self):
 
@@ -254,6 +273,7 @@ class Lang2SegTrack:
                     if not ret:
                         break
                 self.frame_display = frame.copy()
+                self.history_frames.append(frame)
                 cv2.setMouseCallback("Video Tracking", self.draw_bbox, param=self.frame_display)
 
                 if not self.input_queue.empty():
@@ -266,21 +286,30 @@ class Lang2SegTrack:
                 if self.add_new:
                     predictor.reset_state(state)
                     self.add_to_state(predictor, state, self.prompts_list)
-                    self.add_new = False
 
                 predictor.append_frame_to_inference_state(state, frame)
                 self.track_and_visualize(predictor, state, frame, writer)
+
+                if self.add_new:
+                    x = max(self.object_start_frame_idx) if len(self.object_start_frame_idx) != 0 else -1
+                    for id in range(len(self.prompts_list) - x - 1):
+                        x = id + x + 1
+                        self.object_start_frame_idx[x] = state['num_frames'] - 1
+                        self.object_start_promts[x] = self.all_forward_masks[x][0]
+                    self.add_new = False
+
                 if (state["num_frames"] - 1) % self.max_frames and len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
                     predictor.append_frame_as_cond_frame(state, state["num_frames"] - 1)
                 predictor.release_old_frames(state, state["num_frames"] - 1, self.max_frames, 0, release_images=True)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
-
         if self.mode == "realtime":
             pipeline.stop()
         else:
             cap.release()
+        self.track_backward()
+        self.visualize_final_masks()
         if writer:
             writer.close()
         cv2.destroyAllWindows()
@@ -296,18 +325,9 @@ if __name__ == "__main__":
     tracker = Lang2SegTrack(sam_type="sam2.1_hiera_tiny",
                             model_path="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
                             video_path="assets/05_default_juggle.mp4",
-                            output_path="processed_video.mp4",
+                            output_path="fowrad_processed_video.mp4",
                             mode="video",
-                            first_prompts=[mask],
+                            # first_prompts=[mask],
                             save_video=True,
                             gdino_16=True)
     tracker.track()
-
-    # out = tracker.predict_img(
-    #     [Image.open("assets/img_01.jpg")],
-    #     ["cup.ball"],
-    # )
-    # print(out)
-    # img = cv2.imread("assets/img_01.jpg")
-    # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    # display_image_with_boxes(img, list(out[0]["boxes"]), out[0]["scores"], list(out[0]["labels"]))
