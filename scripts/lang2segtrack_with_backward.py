@@ -1,5 +1,6 @@
 import base64
 import os
+import shutil
 import threading
 import queue
 import time
@@ -16,43 +17,46 @@ from models.gdino.utils import display_image_with_boxes
 from models.sam2.sam import SAM
 from utils.color import COLOR
 import pyrealsense2 as rs
-
-from utils.utils import prepare_frames_or_path, bbox_process, save_frames_to_temp_dir
+from utils.utils import save_frames_to_temp_dir, visualize_selected_masks_as_video, filter_mask_outliers
 
 
 class Lang2SegTrack:
-    def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
-                 video_path:str="", output_path:str="", max_frames:int=20,
-                 first_prompts: list | None = None, save_video=True,
-                 gdino_16=False, device="cuda:0", mode="realtime"):
+    def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_large.pt",
+                 video_path:str="", output_path:str="", use_txt_prompt:bool=False, max_frames:int=60,
+                 first_prompts: list | None = None, save_video=True, device="cuda:0", mode="realtime"):
         self.sam_type = sam_type # the type of SAM model to use
         self.model_path = model_path # the path to the SAM model checkpoint
         self.video_path = video_path # the path to the video to track. If mode="video", this param is required.
         self.output_path = output_path # the path to save the output video. If save_video=False, this param is ignored.
         self.max_frames = max_frames # The maximum number of frames to be retained, beyond which the oldest frames are deleted,
         # so that the memory footprint does not grow indefinitely
-        # If the number of tracked objects is small and won't be occluded, you can set it to a small value(such as 10) to increase the FPS,
-        # and if the number of tracked objects is large and likely to be occluded, set it to a larger value(such as 60) to enhance tracking
+        # If the number of tracked objects is large and likely to be occluded, set it to a larger value(such as 120) to enhance tracking
+        self.first_prompts = first_prompts  # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
+        # [mask, point, bbox], mask: np.ndarray[H, W], point: list[int], bbox: list[int]
         self.save_video = save_video # whether to save the output video
         self.device = device
         self.mode = mode # the mode to run the tracker. "video" or "realtime"
+        if self.mode == 'img' and not use_txt_prompt:
+            raise ValueError("In 'img' mode, use_txt_prompt must be True")
 
         self.sam = SAM()
-        self.sam.build_model(self.sam_type, self.model_path, predictor_type=mode, device=device)
-        self.gdino = GDINO()
-        self.gdino_16 = gdino_16
-        if not gdino_16:
-            print("Building GroundingDINO model...")
-            self.gdino.build_model(device=device)
+        self.sam.build_model(self.sam_type, self.model_path, predictor_type=mode, device=device, use_txt_prompt=use_txt_prompt)
+        if use_txt_prompt:
+            self.gdino = GDINO()
+            self.gdino_16 = False
+            if not self.gdino_16:
+                print("Building GroundingDINO model...")
+                self.gdino.build_model(device=device)
+        else:
+            self.gdino = None
 
         self.history_frames = []
         self.object_start_frame_idx = {}
-        self.object_start_promts = {}
+        self.object_start_prompts = {}
         self.all_forward_masks = {}
+        self.all_final_masks = {}
 
         self.input_queue = queue.Queue()
-        self.first_prompts = first_prompts # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
-        #[mask, point, bbox], mask: np.ndarray[H, W], point: list[int], bbox: list[int]
         self.drawing = False
         self.add_new = False
         self.ix, self.iy = -1, -1
@@ -62,7 +66,7 @@ class Lang2SegTrack:
             self.prompts_list = self.first_prompts
             for obj_id, prompt in enumerate(self.prompts_list):
                 self.object_start_frame_idx[obj_id] = 0
-                self.object_start_promts.setdefault(obj_id, []).append(prompt)
+                self.object_start_prompts.setdefault(obj_id, []).append(prompt)
             self.add_new = True
         else:
             self.prompts_list = []
@@ -115,9 +119,10 @@ class Lang2SegTrack:
         if (any(len(state["point_inputs_per_obj"][i]) > 0 for i in range(len(state["point_inputs_per_obj"]))) or
             any(len(state["mask_inputs_per_obj"][i]) > 0 for i in range(len(state["mask_inputs_per_obj"])))):
             for frame_idx, obj_ids, masks in predictor.propagate_in_frame(state, state["num_frames"] - 1):
-                self.prompts_list=[]
+                self.prompts_list = []
                 for obj_id, mask in zip(obj_ids, masks):
                     mask = mask[0].cpu().numpy() > 0.0
+                    mask = filter_mask_outliers(mask)
                     self.all_forward_masks.setdefault(obj_id, []).append(mask)
                     nonzero = np.argwhere(mask)
                     if nonzero.size == 0:
@@ -127,9 +132,12 @@ class Lang2SegTrack:
                         y_max, x_max = nonzero.max(axis=0)
                         bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
                     self.draw_mask_and_bbox(frame, mask, bbox, obj_id)
-                    self.prompts_list.append([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]])
-        self.show_fps(frame)
-        cv2.imshow("Video Tracking", frame)
+                    self.prompts_list.append(mask)
+                    # self.prompts_list.append([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]])
+            # max_obj_id = max(self.all_forward_masks.keys())
+            # self.prompts_list = [self.all_forward_masks[i][-1] for i in range(max_obj_id + 1)]
+        frame_dis = self.show_fps(frame)
+        cv2.imshow("Video Tracking", frame_dis)
 
         if writer:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -146,14 +154,16 @@ class Lang2SegTrack:
 
 
     def show_fps(self, frame):
+        frame = frame.copy()
         curr_time = time.time()
         fps = 1 / (curr_time - self.prev_time)
         self.prev_time = curr_time
         fps_str = f"FPS: {fps:.2f}"
         cv2.putText(frame, fps_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        return frame
 
 
-    def visualize_final_masks(self, output_path="final_tracked_output.mp4", fps=25):
+    def visualize_final_masks(self, output_path="final_tracked_video.mp4", fps=25):
         if not hasattr(self, "all_final_masks") or not self.all_final_masks:
             print("No final masks found. Please run `track()` and `track_backward()` first.")
             return
@@ -189,10 +199,6 @@ class Lang2SegTrack:
         predictor = self.sam.video_predictor
 
         print("Starting backward tracking for each object...")
-        all_final_masks = {}
-        # print(len(self.all_forward_masks[0]))
-        # print(len(self.all_forward_masks[1]))
-        # print(len(self.all_forward_masks[2]))
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
             for obj_id in range(max(self.object_start_frame_idx)+1):
 
@@ -205,7 +211,7 @@ class Lang2SegTrack:
                     history_frames = self.history_frames[:start_idx]
                     history_frames = history_frames[::-1]
                     frames = save_frames_to_temp_dir(history_frames)
-                    prompt = self.object_start_promts[obj_id]
+                    prompt = self.object_start_prompts[obj_id]
                     reverse_state = predictor.init_state(
                         frames, offload_state_to_cpu=False, offload_video_to_cpu=False
                     )
@@ -220,15 +226,24 @@ class Lang2SegTrack:
                     forward_masks = self.all_forward_masks.get(obj_id, [])
                     full_masks = backward_masks + forward_masks[1:] if len(forward_masks) > 1 else backward_masks
                     #predictor.reset_state(reverse_state)
-                all_final_masks[obj_id] = full_masks
-
+                self.all_final_masks[obj_id] = full_masks
 
         print("Backward tracking completed. Merged object trajectories are ready.")
-        self.all_final_masks = all_final_masks
-        # print(len(self.all_final_masks[0]))
-        # print(len(self.all_final_masks[1]))
-        # print(len(self.all_final_masks[2]))
 
+        # save mask img
+        output_dir = "mask_outputs"
+        if os.path.exists(output_dir) and os.path.isdir(output_dir):
+            shutil.rmtree(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        for obj_id, masks in self.all_final_masks.items():
+            obj_dir = os.path.join(output_dir, f"obj_{obj_id}")
+            os.makedirs(obj_dir, exist_ok=True)
+            for frame_idx, mask in enumerate(masks):
+                mask_image = (mask * 255).astype(np.uint8)
+                mask_path = os.path.join(obj_dir, f"frame_{frame_idx:04d}.png")
+                cv2.imwrite(mask_path, mask_image)
+        print(f"Masks saved to {output_dir}")
+        visualize_selected_masks_as_video()
 
     def track(self):
 
@@ -255,7 +270,7 @@ class Lang2SegTrack:
         self.height, self.width = color_image.shape[:2]
 
         if self.save_video:
-            writer = imageio.get_writer(self.output_path, fps=30)
+            writer = imageio.get_writer(self.output_path, fps=25)
         else:
             writer = None
 
@@ -284,23 +299,25 @@ class Lang2SegTrack:
                     self.add_new = True
 
                 if self.add_new:
+                    existing_obj_ids = set(state["obj_ids"])
                     predictor.reset_state(state)
                     self.add_to_state(predictor, state, self.prompts_list)
+                    current_obj_ids = set(state["obj_ids"])
+                    newly_added_ids = current_obj_ids - existing_obj_ids
 
                 predictor.append_frame_to_inference_state(state, frame)
                 self.track_and_visualize(predictor, state, frame, writer)
 
                 if self.add_new:
-                    x = max(self.object_start_frame_idx) if len(self.object_start_frame_idx) != 0 else -1
-                    for id in range(len(self.prompts_list) - x - 1):
-                        x = id + x + 1
-                        self.object_start_frame_idx[x] = state['num_frames'] - 1
-                        self.object_start_promts[x] = self.all_forward_masks[x][0]
+                    for obj_id in newly_added_ids:
+                        self.object_start_frame_idx[obj_id] = state['num_frames'] - 1
+                        self.object_start_prompts[obj_id] = self.all_forward_masks[obj_id][0]
                     self.add_new = False
 
-                if (state["num_frames"] - 1) % self.max_frames and len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
-                    predictor.append_frame_as_cond_frame(state, state["num_frames"] - 1)
-                predictor.release_old_frames(state, state["num_frames"] - 1, self.max_frames, 0, release_images=True)
+                if state["num_frames"] % self.max_frames == 0:
+                    if len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
+                        predictor.append_frame_as_cond_frame(state, state["num_frames"] - 2)
+                    predictor.release_old_frames(state)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -320,14 +337,11 @@ class Lang2SegTrack:
 
 
 if __name__ == "__main__":
-    mask = Image.open("mask_images/mask_0.png")
-    mask = np.array(mask)
     tracker = Lang2SegTrack(sam_type="sam2.1_hiera_tiny",
                             model_path="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
                             video_path="assets/05_default_juggle.mp4",
-                            output_path="fowrad_processed_video.mp4",
+                            output_path="forward_tracked_video.mp4",
                             mode="video",
-                            # first_prompts=[mask],
                             save_video=True,
-                            gdino_16=True)
+                            use_txt_prompt=False)
     tracker.track()

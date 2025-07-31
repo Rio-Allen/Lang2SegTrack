@@ -17,37 +17,40 @@ from models.sam2.sam import SAM
 from utils.color import COLOR
 import pyrealsense2 as rs
 
-from utils.utils import prepare_frames_or_path, bbox_process
+from utils.utils import filter_mask_outliers
 
 
 class Lang2SegTrack:
-    def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_tiny.pt",
-                 video_path:str="", output_path:str="", max_frames:int=20,
-                 first_prompts: list | None = None, save_video=True,
-                 gdino_16=False, device="cuda:0", mode="realtime"):
+    def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_large.pt",
+                 video_path:str="", output_path:str="", use_txt_prompt:bool=False, max_frames:int=60,
+                 first_prompts: list | None = None, save_video=True, device="cuda:0", mode="realtime"):
         self.sam_type = sam_type # the type of SAM model to use
         self.model_path = model_path # the path to the SAM model checkpoint
         self.video_path = video_path # the path to the video to track. If mode="video", this param is required.
         self.output_path = output_path # the path to save the output video. If save_video=False, this param is ignored.
         self.max_frames = max_frames # The maximum number of frames to be retained, beyond which the oldest frames are deleted,
         # so that the memory footprint does not grow indefinitely
-        # If the number of tracked objects is small and won't be occluded, you can set it to a small value(such as 10) to increase the FPS,
-        # and if the number of tracked objects is large and likely to be occluded, set it to a larger value(such as 60) to enhance tracking
+        # If the number of tracked objects is large and likely to be occluded, set it to a larger value(such as 120) to enhance tracking
+        self.first_prompts = first_prompts  # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
+        # [mask, point, bbox], mask: np.ndarray[H, W], point: list[int], bbox: list[int]
         self.save_video = save_video # whether to save the output video
         self.device = device
-        self.mode = mode # the mode to run the tracker. "img", "video" or "realtime"
+        self.mode = mode # the mode to run the tracker. "video" or "realtime"
+        if self.mode == 'img' and not use_txt_prompt:
+            raise ValueError("In 'img' mode, use_txt_prompt must be True")
 
         self.sam = SAM()
-        self.sam.build_model(self.sam_type, self.model_path, predictor_type=mode, device=device)
-        self.gdino = GDINO()
-        self.gdino_16 = gdino_16
-        if not gdino_16:
-            print("Building GroundingDINO model...")
-            self.gdino.build_model(device=device)
+        self.sam.build_model(self.sam_type, self.model_path, predictor_type=mode, device=device, use_txt_prompt=use_txt_prompt)
+        if use_txt_prompt:
+            self.gdino = GDINO()
+            self.gdino_16 = False
+            if not self.gdino_16:
+                print("Building GroundingDINO model...")
+                self.gdino.build_model(device=device)
+        else:
+            self.gdino = None
 
         self.input_queue = queue.Queue()
-        self.first_prompts = first_prompts # the initial bounding boxes ,points or masks to track. If not None, the tracker will use the first frame to detect objects.
-        #[mask, point, bbox], mask: np.ndarray[H, W], point: list[int], bbox: list[int]
         self.drawing = False
         self.add_new = False
         self.ix, self.iy = -1, -1
@@ -108,6 +111,7 @@ class Lang2SegTrack:
                 self.prompts_list=[]
                 for obj_id, mask in zip(obj_ids, masks):
                     mask = mask[0].cpu().numpy() > 0.0
+                    mask = filter_mask_outliers(mask)
                     nonzero = np.argwhere(mask)
                     if nonzero.size == 0:
                         bbox = [0, 0, 0, 0]
@@ -117,8 +121,8 @@ class Lang2SegTrack:
                         bbox = [x_min, y_min, x_max - x_min, y_max - y_min]
                     self.draw_mask_and_bbox(frame, mask, bbox, obj_id)
                     self.prompts_list.append([bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[3]])
-        self.show_fps(frame)
-        cv2.imshow("Video Tracking", frame)
+        frame_dis = self.show_fps(frame)
+        cv2.imshow("Video Tracking", frame_dis)
 
         if writer:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -135,11 +139,13 @@ class Lang2SegTrack:
 
 
     def show_fps(self, frame):
+        frame = frame.copy()
         curr_time = time.time()
         fps = 1 / (curr_time - self.prev_time)
         self.prev_time = curr_time
         fps_str = f"FPS: {fps:.2f}"
         cv2.putText(frame, fps_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        return frame
 
 
     def predict_img(
@@ -149,14 +155,12 @@ class Lang2SegTrack:
         box_threshold: float = 0.3,
         text_threshold: float = 0.25,
     ):
-        """Predicts masks for given images and text prompts using GDINO and SAM models.
-
+        """
         Parameters:
             images_pil (list[Image.Image]): List of input images.
             texts_prompt (list[str]): List of text prompts corresponding to the images.
             box_threshold (float): Threshold for box predictions.
             text_threshold (float): Threshold for text predictions.
-
         Returns:
             list[dict]: List of results containing masks and other outputs for each image.
             Output format:
@@ -236,7 +240,7 @@ class Lang2SegTrack:
         self.height, self.width = color_image.shape[:2]
 
         if self.save_video:
-            writer = imageio.get_writer(self.output_path, fps=30)
+            writer = imageio.get_writer(self.output_path, fps=25)
         else:
             writer = None
 
@@ -270,9 +274,10 @@ class Lang2SegTrack:
 
                 predictor.append_frame_to_inference_state(state, frame)
                 self.track_and_visualize(predictor, state, frame, writer)
-                if (state["num_frames"] - 1) % self.max_frames and len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
-                    predictor.append_frame_as_cond_frame(state, state["num_frames"] - 1)
-                predictor.release_old_frames(state, state["num_frames"] - 1, self.max_frames, 0, release_images=True)
+                if state["num_frames"] % self.max_frames == 0:
+                    if len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
+                        predictor.append_frame_as_cond_frame(state, state["num_frames"] - 2)
+                    predictor.release_old_frames(state)
 
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
@@ -300,7 +305,7 @@ if __name__ == "__main__":
                             mode="video",
                             first_prompts=[mask],
                             save_video=True,
-                            gdino_16=True)
+                            use_txt_prompt=False)
     tracker.track()
 
     # out = tracker.predict_img(
