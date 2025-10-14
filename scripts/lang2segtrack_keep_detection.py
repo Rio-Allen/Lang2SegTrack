@@ -6,6 +6,9 @@ import queue
 import time
 from io import BytesIO
 
+# Set OpenCV to headless mode before importing cv2
+os.environ['QT_QPA_PLATFORM'] = 'offscreen'
+
 import cv2
 import torch
 import gc
@@ -25,7 +28,7 @@ from utils.ObjectInfoManager import ObjectInfoManager
 class Lang2SegTrack:
     def __init__(self, sam_type:str="sam2.1_hiera_tiny", model_path:str="models/sam2/checkpoints/sam2.1_hiera_large.pt",
                  video_path:str="", output_path:str="", use_txt_prompt:bool=False, max_frames:int=60,
-                 first_prompts: list | None = None, save_video=True, device="cuda:0", mode="realtime"):
+                 first_prompts: list | None = None, save_video=True, device="cuda:0", mode="realtime", headless=False):
         self.sam_type = sam_type # the type of SAM model to use
         self.model_path = model_path # the path to the SAM model checkpoint
         self.video_path = video_path # the path to the video to track. If mode="video", this param is required.
@@ -38,6 +41,7 @@ class Lang2SegTrack:
         self.save_video = save_video # whether to save the output video
         self.device = device
         self.mode = mode # the mode to run the tracker. "video" or "realtime"
+        self.headless = headless # whether to run in headless mode (no GUI display)
         if self.mode == 'img' and not use_txt_prompt:
             raise ValueError("In 'img' mode, use_txt_prompt must be True")
 
@@ -147,7 +151,8 @@ class Lang2SegTrack:
                 self.prompts['prompts'] = self.existing_obj_outputs.copy()
 
         frame_dis = self.show_fps(frame)
-        cv2.imshow("Video Tracking", frame_dis)
+        if not self.headless:
+            cv2.imshow("Video Tracking", frame_dis)
 
         if writer:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -196,13 +201,15 @@ class Lang2SegTrack:
                 self.draw_mask_and_bbox(base_frame, mask, bbox, obj_id)
 
             writer.append_data(cv2.cvtColor(base_frame, cv2.COLOR_BGR2RGB))
-            cv2.imshow("Final Tracking Visualization", base_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            if not self.headless:
+                cv2.imshow("Final Tracking Visualization", base_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
 
         writer.close()
         print(f"Final visualization saved to {output_path}")
-        cv2.destroyAllWindows()
+        if not self.headless:
+            cv2.destroyAllWindows()
 
     def predict_img(
             self,
@@ -349,7 +356,8 @@ class Lang2SegTrack:
         else:
             writer = None
 
-        cv2.namedWindow("Video Tracking")
+        if not self.headless:
+            cv2.namedWindow("Video Tracking")
 
         threading.Thread(target=self.input_thread, daemon=True).start()
 
@@ -364,7 +372,8 @@ class Lang2SegTrack:
                         break
                 self.frame_display = frame.copy()
                 # self.history_frames.append(frame)
-                cv2.setMouseCallback("Video Tracking", self.draw_bbox, param=self.frame_display)
+                if not self.headless:
+                    cv2.setMouseCallback("Video Tracking", self.draw_bbox, param=self.frame_display)
 
                 if not self.input_queue.empty():
                     self.current_text_prompt = self.input_queue.get()
@@ -439,9 +448,10 @@ class Lang2SegTrack:
                         predictor.append_frame_as_cond_frame(state, state["num_frames"] - 2)
                     predictor.release_old_frames(state)
 
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    break
+                if not self.headless:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        break
 
         if self.mode == "realtime":
             pipeline.stop()
@@ -451,7 +461,8 @@ class Lang2SegTrack:
         # self.visualize_final_masks()
         if writer:
             writer.close()
-        cv2.destroyAllWindows()
+        if not self.headless:
+            cv2.destroyAllWindows()
         del predictor, state
         gc.collect()
         torch.clear_autocast_cache()
@@ -466,6 +477,7 @@ if __name__ == "__main__":
                             output_path="forward_tracked_video.mp4",
                             mode="video",
                             save_video=True,
-                            use_txt_prompt=True)
+                            use_txt_prompt=True,
+                            headless=True)  # Set to True for headless mode (no GUI)
     tracker.current_text_prompt = 'car'
     tracker.track()
