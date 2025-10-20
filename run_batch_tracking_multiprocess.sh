@@ -12,13 +12,13 @@ echo "多进程批量视频跟踪"
 echo "=========================================="
 
 # 创建输出目录
-mkdir -p batch_output
-mkdir -p batch_output/tracked_videos
+mkdir -p output
+mkdir -p output/tracked_videos
 
 # 配置参数
 VIDEO_LIST="videos.txt"
 TEXT_PROMPT="person"
-OUTPUT_JSONL="output/tracking_results_multiprocess.jsonl"
+OUTPUT_JSONL="output/tracking.jsonl"
 OUTPUT_VIDEO_DIR="output/tracked_videos"
 
 # GPU配置

@@ -4,6 +4,7 @@ import argparse
 import time
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 import torch
 import gc
 import cv2
@@ -11,10 +12,132 @@ import numpy as np
 from PIL import Image
 import imageio
 
-from models.gdino.models.gdino import GDINO
+# from models.gdino.models.gdino import GDINO  # 注释掉GDINO，改用YOLOv11
+from ultralytics import YOLO
 from models.sam2.sam import SAM
 from utils.color import COLOR
 from utils.utils import batch_box_iou, filter_mask_outliers
+
+# Set multiprocessing start method to 'spawn' for CUDA compatibility
+# This must be done before any CUDA operations
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    # Already set, ignore
+    pass
+
+
+# Text prompt to COCO class mapping
+# COCO dataset has 80 classes, here we define common mappings
+TEXT_PROMPT_TO_CLASS = {
+    'person': 0,
+    'people': 0,
+    'human': 0,
+    'bicycle': 1,
+    'bike': 1,
+    'car': 2,
+    'vehicle': 2,
+    'motorcycle': 3,
+    'motorbike': 3,
+    'airplane': 4,
+    'plane': 4,
+    'bus': 5,
+    'train': 6,
+    'truck': 7,
+    'boat': 8,
+    'traffic light': 9,
+    'fire hydrant': 10,
+    'stop sign': 11,
+    'parking meter': 12,
+    'bench': 13,
+    'bird': 14,
+    'cat': 15,
+    'dog': 16,
+    'horse': 17,
+    'sheep': 18,
+    'cow': 19,
+    'elephant': 20,
+    'bear': 21,
+    'zebra': 22,
+    'giraffe': 23,
+    'backpack': 24,
+    'umbrella': 25,
+    'handbag': 26,
+    'tie': 27,
+    'suitcase': 28,
+    'frisbee': 29,
+    'skis': 30,
+    'snowboard': 31,
+    'sports ball': 32,
+    'ball': 32,
+    'kite': 33,
+    'baseball bat': 34,
+    'baseball glove': 35,
+    'skateboard': 36,
+    'surfboard': 37,
+    'tennis racket': 38,
+    'bottle': 39,
+    'wine glass': 40,
+    'cup': 41,
+    'fork': 42,
+    'knife': 43,
+    'spoon': 44,
+    'bowl': 45,
+    'banana': 46,
+    'apple': 47,
+    'sandwich': 48,
+    'orange': 49,
+    'broccoli': 50,
+    'carrot': 51,
+    'hot dog': 52,
+    'pizza': 53,
+    'donut': 54,
+    'cake': 55,
+    'chair': 56,
+    'couch': 57,
+    'sofa': 57,
+    'potted plant': 58,
+    'plant': 58,
+    'bed': 59,
+    'dining table': 60,
+    'table': 60,
+    'toilet': 61,
+    'tv': 62,
+    'television': 62,
+    'laptop': 63,
+    'mouse': 64,
+    'remote': 65,
+    'keyboard': 66,
+    'cell phone': 67,
+    'phone': 67,
+    'microwave': 68,
+    'oven': 69,
+    'toaster': 70,
+    'sink': 71,
+    'refrigerator': 72,
+    'fridge': 72,
+    'book': 73,
+    'clock': 74,
+    'vase': 75,
+    'scissors': 76,
+    'teddy bear': 77,
+    'hair drier': 78,
+    'toothbrush': 79,
+}
+
+# COCO class names (for reverse lookup)
+COCO_CLASS_NAMES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat',
+    'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog',
+    'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard', 'sports ball', 'kite',
+    'baseball bat', 'baseball glove', 'skateboard', 'surfboard', 'tennis racket', 'bottle',
+    'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch', 'potted plant',
+    'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+    'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors',
+    'teddy bear', 'hair drier', 'toothbrush'
+]
 
 
 class VideoTracker:
@@ -43,40 +166,94 @@ class VideoTracker:
         self.fps = fps
         
         # 跟踪参数
-        self.iou_threshold = 0.3
+        self.iou_threshold = 0.2
         self.box_threshold = 0.5
-        self.text_threshold = 0.8
-        self.score_threshold = 0.3
+        self.text_threshold = 0.85
+        self.score_threshold = 0.5
         
         # 初始化SAM模型
         self.sam = SAM()
         self.sam.build_model(sam_type, model_path, predictor_type="video", 
                             device=device, use_txt_prompt=True)
         
-        # 初始化GroundingDINO模型
-        self.gdino = GDINO()
-        self.gdino.build_model(device=device)
+        # # 初始化GroundingDINO模型 (注释掉，改用YOLOv11)
+        # self.gdino = GDINO()
+        # self.gdino.build_model(device=device)
+        
+        # 初始化YOLOv11模型
+        self.yolo = YOLO('yolo11l.pt')  # 使用YOLOv11x模型，也可以换成yolo11n.pt, yolo11s.pt等
+        self.yolo.to(device)
     
     def detect_objects(self, frame, text_prompt):
-        """使用GroundingDINO检测目标"""
-        detection = self.gdino.predict(
-            [Image.fromarray(frame)],
-            [text_prompt],
-            self.box_threshold, 
-            self.text_threshold
-        )[0]
+        """使用YOLOv11检测目标"""
+        # 将text_prompt转换为COCO类别ID
+        text_prompt_lower = text_prompt.lower().strip()
+        target_class_id = TEXT_PROMPT_TO_CLASS.get(text_prompt_lower, None)
         
-        scores = detection['scores'].cpu().numpy()
-        labels = detection['labels']
-        boxes = detection['boxes'].cpu().numpy().astype(np.int32)
+        if target_class_id is None:
+            # 如果text_prompt不在映射中，尝试在COCO类名中查找
+            for class_name in COCO_CLASS_NAMES:
+                if text_prompt_lower in class_name or class_name in text_prompt_lower:
+                    target_class_id = COCO_CLASS_NAMES.index(class_name)
+                    break
         
-        # 过滤低置信度检测
-        filter_mask = scores > self.score_threshold
-        valid_boxes = boxes[filter_mask]
-        valid_labels = labels[filter_mask]
-        valid_scores = scores[filter_mask]
+        if target_class_id is None:
+            print(f"Warning: Text prompt '{text_prompt}' not found in COCO classes. No detection will be performed.")
+            return np.array([]), np.array([]), np.array([])
         
-        return valid_boxes, valid_labels, valid_scores
+        # 使用YOLOv11进行检测
+        results = self.yolo(frame, verbose=False, device=self.device)
+        
+        valid_boxes = []
+        valid_labels = []
+        valid_scores = []
+        
+        # 提取检测结果
+        for result in results:
+            boxes = result.boxes
+            for i in range(len(boxes)):
+                class_id = int(boxes.cls[i])
+                
+                # 只保留目标类别的检测结果
+                if class_id == target_class_id:
+                    score = float(boxes.conf[i])
+                    
+                    # 过滤低置信度检测
+                    if score > self.score_threshold:
+                        # YOLOv11的box格式是[x1, y1, x2, y2]
+                        box = boxes.xyxy[i].cpu().numpy()
+                        x1, y1, x2, y2 = box.astype(np.int32)
+                        
+                        valid_boxes.append([x1, y1, x2, y2])
+                        valid_labels.append(COCO_CLASS_NAMES[class_id])
+                        valid_scores.append(score)
+        
+        return np.array(valid_boxes), np.array(valid_labels), np.array(valid_scores)
+    
+    # # 原来的GroundingDINO检测方法（注释保留）
+    # def detect_objects(self, frame, text_prompt):
+    #     """使用GroundingDINO检测目标"""
+    #     detection = self.gdino.predict(
+    #         [Image.fromarray(frame)],
+    #         [text_prompt],
+    #         self.box_threshold, 
+    #         self.text_threshold
+    #     )[0]
+    #     
+    #     scores = detection['scores'].cpu().numpy()
+    #     labels = detection['labels']
+    #     boxes = detection['boxes'].cpu().numpy().astype(np.int32)
+    #     
+    #     # 过滤低置信度检测
+    #     filter_mask = scores > self.score_threshold
+    #     valid_boxes = boxes[filter_mask]
+    #     # Convert labels to numpy array first if it's a list
+    #     if isinstance(labels, list):
+    #         labels = np.array(labels)
+    #     valid_labels = labels[filter_mask]
+    #     valid_scores = scores[filter_mask]
+    #     
+    #     return valid_boxes, valid_labels, valid_scores
     
     def track_video(self, video_path, text_prompt, output_video_path=None):
         """
@@ -170,6 +347,9 @@ class VideoTracker:
                     last_text_prompt != text_prompt
                 )
                 
+                # 初始化 add_new 标志
+                add_new = False
+                
                 if should_detect:
                     valid_boxes, valid_labels, valid_scores = self.detect_objects(frame, text_prompt)
                     
@@ -202,8 +382,6 @@ class VideoTracker:
                         prompts['labels'].extend(valid_labels)
                         prompts['scores'].extend(valid_scores.tolist())
                         add_new = True
-                    else:
-                        add_new = False
                     
                     last_text_prompt = text_prompt
                 else:
@@ -278,9 +456,16 @@ class VideoTracker:
                 
                 # 内存管理
                 if state["num_frames"] % self.max_frames == 0:
-                    if len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
-                        predictor.append_frame_as_cond_frame(state, state["num_frames"] - 2)
-                    predictor.release_old_frames(state)
+                    try:
+                        if len(state["output_dict"]["non_cond_frame_outputs"]) != 0:
+                            # 检查帧索引是否有效
+                            target_frame = state["num_frames"] - 2
+                            if target_frame >= 0 and target_frame in state["output_dict"]["non_cond_frame_outputs"]:
+                                predictor.append_frame_as_cond_frame(state, target_frame)
+                        predictor.release_old_frames(state)
+                    except Exception as e:
+                        print(f"Warning: Memory management error at frame {state['num_frames']}: {e}")
+                        # 继续处理，不中断
         
         # 清理资源
         cap.release()
@@ -290,7 +475,8 @@ class VideoTracker:
         # 清理状态
         del predictor, state
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         elapsed = time.time() - start_time
         num_objects = len(results['objects'])
@@ -317,9 +503,19 @@ def process_single_video(args_tuple):
     gpu_id = config['gpu_id']
     device = f"cuda:{gpu_id}"
     
+    # 添加延迟避免多个进程同时初始化CUDA
+    import random
+    time.sleep(random.uniform(0.5, 2.0) * (gpu_id % 4))
+    
     print(f"[GPU {gpu_id}] Processing: {video_path}")
     
     try:
+        # 设置当前CUDA设备
+        torch.cuda.set_device(gpu_id)
+        
+        # 清理GPU缓存
+        torch.cuda.empty_cache()
+        
         # 创建跟踪器（每个进程独立创建，使用指定的GPU）
         tracker = VideoTracker(
             sam_type=config['sam_type'],
@@ -352,8 +548,12 @@ def process_single_video(args_tuple):
     
     finally:
         # 清理GPU内存
+        if 'tracker' in locals():
+            del tracker
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(gpu_id)
 
 
 def get_available_gpus():
@@ -468,8 +668,6 @@ def process_video_list_multiprocess(video_list_path, text_prompt, output_jsonl_p
             print(f"Resume mode: Skipping {original_count - len(video_paths)} already processed videos")
             print(f"Remaining videos to process: {len(video_paths)}")
     
-    video_paths = valid_video_paths
-    
     if not video_paths:
         if resume and completed_videos:
             print("All videos have been processed already!")
@@ -516,8 +714,17 @@ def process_video_list_multiprocess(video_list_path, text_prompt, output_jsonl_p
         # 生成输出视频路径
         output_video_path = None
         if output_video_dir:
-            video_name = Path(video_path).stem
-            output_video_path = os.path.join(output_video_dir, 
+            # 获取原视频的父目录名称（例如：20241203-083000）
+            video_path_obj = Path(video_path)
+            parent_dir_name = video_path_obj.parent.name
+            video_name = video_path_obj.stem
+            
+            # 创建对应的输出子目录
+            output_subdir = os.path.join(output_video_dir, parent_dir_name)
+            os.makedirs(output_subdir, exist_ok=True)
+            
+            # 生成输出视频路径
+            output_video_path = os.path.join(output_subdir, 
                                              f"{video_name}_tracked.mp4")
         
         # 配置参数
@@ -534,28 +741,30 @@ def process_video_list_multiprocess(video_list_path, text_prompt, output_jsonl_p
     
     # 使用进程池执行任务
     start_time = time.time()
-    results = []
+    success_count = 0
     
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    # 限制同时初始化模型的进程数，避免CUDA冲突
+    max_workers_init = min(num_workers, 4)  # 最多4个进程同时初始化
+    
+    with ProcessPoolExecutor(max_workers=num_workers, mp_context=multiprocessing.get_context('spawn')) as executor:
         # 提交所有任务
         futures = {executor.submit(process_single_video, task): task for task in tasks}
         
-        # 收集结果
+        # 收集结果并立即写入
         completed = 0
         for future in as_completed(futures):
             result, video_path, success = future.result()
             completed += 1
             
             if success and result:
-                results.append(result)
+                # 立即写入结果到JSONL（追加模式）
+                with open(output_jsonl_path, 'a') as jsonl_file:
+                    jsonl_file.write(json.dumps(result, ensure_ascii=False) + '\n')
+                success_count += 1
                 print(f"\nProgress: {completed}/{len(video_paths)} videos completed")
+                print(f"✓ Result saved to {output_jsonl_path}")
             else:
                 print(f"\nProgress: {completed}/{len(video_paths)} videos completed (last one failed)")
-    
-    # 保存结果到JSONL（追加模式）
-    with open(output_jsonl_path, 'a') as jsonl_file:
-        for result in results:
-            jsonl_file.write(json.dumps(result, ensure_ascii=False) + '\n')
     
     elapsed = time.time() - start_time
     total_videos = len(video_paths) + len(completed_videos)
@@ -566,9 +775,9 @@ def process_video_list_multiprocess(video_list_path, text_prompt, output_jsonl_p
     print(f"Total time: {elapsed:.2f}s")
     if len(video_paths) > 0:
         print(f"Average time per video: {elapsed/len(video_paths):.2f}s")
-    print(f"Successfully processed this run: {len(results)}/{len(video_paths)}")
+    print(f"Successfully processed this run: {success_count}/{len(video_paths)}")
     if resume and completed_videos:
-        print(f"Total completed (including previous runs): {len(results) + len(completed_videos)}/{total_videos}")
+        print(f"Total completed (including previous runs): {success_count + len(completed_videos)}/{total_videos}")
     print(f"Results saved to: {output_jsonl_path}")
     if output_video_dir:
         print(f"Videos saved to: {output_video_dir}/")
@@ -592,7 +801,7 @@ def main():
                        help='SAM model checkpoint path')
     parser.add_argument('--detection_frequency', type=int, default=1,
                        help='Detection frequency (detect every N frames)')
-    parser.add_argument('--max_frames', type=int, default=60,
+    parser.add_argument('--max_frames', type=int, default=50,
                        help='Max frames to keep in memory')
     parser.add_argument('--fps', type=float, default=None,
                        help='Processing FPS (None = use original video fps)')
